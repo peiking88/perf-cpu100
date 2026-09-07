@@ -1,0 +1,26 @@
+{
+  "skill_name": "perf-cpu100",
+  "evals": [
+    {
+      "id": 0,
+      "name": "cpu-spike-unnamed",
+      "prompt": "线上跑的一个 C++ 订单网关突然 CPU 飙到 95%，接口响应从 30ms 涨到快 1 秒，4 核机器，老板在群里催定位根因。我登上去 top 看到是我们自己的进程 gateway 在吃 CPU，接下来该怎么一步步查？给我完整的排查命令和判断标准。",
+      "expected_output": "按 SOP 顺序的排查方案：先 top -Hp/pidstat -t 定位线程，再 strace -c 看系统调用分布定方向（futex→锁竞争 / read/write→I/O），再 perf top 找热点函数（含 [k]/[.] 态判定），perf record+火焰图确认调用链，最后有修复后验证步骤（CPU 基线/IPC/P99），而不是零散地罗列命令。",
+      "files": []
+    },
+    {
+      "id": 1,
+      "name": "d-state-stuck",
+      "prompt": "机器上有个 nfsd 相关进程卡在 D 状态，kill -9 都杀不掉，机器 load 也被拖得很高。怎么查它到底卡在哪里？",
+      "expected_output": "D 状态排查路径：ps 找 D 状态进程、wchan 看等待的内核函数、cat /proc/<pid>/stack 看内核调用栈（最关键一步），能判读 rpc_wait_bit_killable=NFS RPC 等待、jbd2=ext4 日志、blk_mq_get_tag=队列满；配套 iostat -xz 看 await/%util。",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "container-perf-blocked",
+      "prompt": "K8s 集群里一个容器化的 Go 服务 CPU 持续 90%+，我 exec 进容器想跑 perf top，报错没权限访问 perf_event。没时间改部署配置，怎么尽快采到火焰图定位热点？",
+      "expected_output": "给出宿主机 perf 方案：docker inspect --format '{{.State.Pid}}' 拿容器进程宿主机 PID，在宿主机 perf record -p <host_pid> 生成火焰图；附带长期方案 --cap-add SYS_ADMIN --cap-add SYS_PTRACE 或 --privileged --pid=host。",
+      "files": []
+    }
+  ]
+}

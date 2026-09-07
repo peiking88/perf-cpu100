@@ -1,0 +1,16 @@
+{
+  "version": "1",
+  "skills": [
+    {
+      "name": "perf-cpu100",
+      "version": "1.0.7",
+      "scope": "personal",
+      "created": "2026-09-07",
+      "updated": "2026-09-07",
+      "auto_trigger": true,
+      "description_chars": 239,
+      "eval_score": 0,
+      "usage_count": 0
+    }
+  ]
+}
