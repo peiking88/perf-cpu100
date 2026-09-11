@@ -187,11 +187,31 @@ cd FlameGraph
 ./stackcollapse-perf.pl /tmp/perf.out | ./flamegraph.pl > /tmp/flamegraph.svg
 ```
 
-**火焰图读法三要点：**
+**火焰图读法四要点：**
 
 - 越宽的"平顶"代表 CPU 占用越多——那就是热点
 - 从下往上看是调用栈，底部是入口函数，顶部是实际执行的函数
 - 关注那些宽且在顶部的函数，那才是真正消耗 CPU 的地方
+- **颜色是随机的，不代表性能好坏**——新手常见误解，别按颜色下结论
+
+### perf report：文字版热点（先于火焰图看）
+
+不想开浏览器看 SVG，直接命令行看热点排序：
+
+```bash
+perf report --stdio --no-children -g none --percent-limit 1
+```
+
+输出示例：
+
+```
+  Overhead  Command    Symbol
+   94.95%  perf_demo  [.] bubble_sort
+    3.54%  perf_demo  [.] matrix_multiply
+    1.22%  perf_demo  [.] hash_compute
+```
+
+`--percent-limit 1` 只显示占比 ≥1% 的函数，过滤噪音。先看文字报告锁定目标，再看火焰图看调用链——两步配合效率最高。
 
 ### perf stat：看硬件计数器
 
@@ -306,6 +326,26 @@ echo 0 > /sys/kernel/debug/tracing/events/kprobes/my_probe/enable
 echo > /sys/kernel/debug/tracing/kprobe_events
 ```
 
+## 跨语言：Java 火焰图
+
+perf + 火焰图不挑语言，但 Java 有特殊问题：**JIT 编译后的代码符号在 perf 里显示为地址**（`[perf-38966.map]`），看不到方法名。
+
+```bash
+# 用 perf 采样 Java 进程 → 火焰图里 99% 是 [perf-38966.map]，没用
+perf record -F 99 -g -p <java_pid> -- sleep 30
+```
+
+**解决方案：async-profiler**，专门解决 JIT 符号问题：
+
+```bash
+# 下载（https://github.com/async-profiler/async-profiler）
+./asprof -d 30 -f java_flamegraph.html <PID>
+```
+
+输出火焰图里 `[perf-38966.map]` 变成真正的 Java 方法名，直接定位到代码行。
+
+**选型规则：** C/C++/Go/Rust → perf + FlameGraph；Java → async-profiler（自动解析 JIT 符号）。
+
 ## 番外：D 状态进程排查
 
 进程卡在 D 状态（Uninterruptible Sleep），kill -9 都杀不掉。D 状态意味着进程在内核态等待某个不可中断的操作完成（通常是 I/O），信号送不进去。
@@ -345,6 +385,36 @@ iostat -xz 1 5
 - `rpc_wait_bit_killable` → 卡在 NFS 的 RPC 等待
 - `jbd2_journal_commit_transaction` → ext4 日志刷盘卡住
 - `blk_mq_get_tag` → 块设备队列满了
+
+## 火焰图该用还是不该用
+
+火焰图是手术刀，不是瑞士军刀。
+
+**该用：**
+
+- CPU 飙高——top 看到进程吃满 CPU，但不知道哪个函数
+- 压测优化——压到一定 QPS 后 RT 飙高，需要找瓶颈
+- 版本对比——新版本比旧版本慢，用火焰图 diff 找差异
+- 启动慢——服务启动几十秒，不知道卡在哪
+
+**不该用：**
+
+- 日常开发调试——IDE debugger 就够了
+- 业务逻辑 Bug——这是 code review 的事
+- I/O 瓶颈——CPU 火焰图看不出来，需要 Off-CPU 火焰图或 iostat
+
+### Off-CPU 火焰图（I/O 瓶颈专用）
+
+CPU 火焰图只能看到"在 CPU 上干什么"，看不到"等 I/O 时等了多久"。进程卡在 I/O 等待时 CPU 使用率反而低，CPU 火焰图会漏掉。
+
+```bash
+# 用 perf 记录调度事件（Off-CPU 分析）
+perf record -e sched:sched_switch -e sched:sched_stat_sleep -p <pid> -- sleep 30
+# 或用 bcc 工具的 offcputime-bpfcc
+offcputime-bpfcc -p <pid> 30
+```
+
+Off-CPU 火焰图越宽 = 阻塞时间越长，直接定位 I/O 等待点。
 
 ## 常见坑
 
@@ -416,6 +486,18 @@ git clone https://github.com/brendangregg/FlameGraph.git /opt/FlameGraph
 alias flamegraph='perf script | /opt/FlameGraph/stackcollapse-perf.pl | /opt/FlameGraph/flamegraph.pl > /tmp/flame_$(date +%Y%m%d_%H%M%S).svg && echo "saved to /tmp/flame_*.svg"'
 ```
 
+### 权限前置：perf_event_paranoid
+
+`perf_event_paranoid` 默认值 4，普通用户无法采样。**生产环境 perf 没数据时先查这个**：
+
+```bash
+cat /proc/sys/kernel/perf_event_paranoid   # 查看当前值
+echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid   # 临时放开（重启失效）
+# 永久：echo 'kernel.perf_event_paranoid=1' >> /etc/sysctl.conf && sysctl -p
+```
+
+值含义：4=仅 root；2=不允许内核分析；1=允许用户态采样（推荐生产值）；0=允许内核态采样；-1=无限制。
+
 ## 验证：修复后必须复测
 
 修复不等于结束，用数据确认问题解决才算关闭。
@@ -433,6 +515,12 @@ perf stat -p <pid> -- sleep 10
 3. 业务侧指标恢复（如 P99 响应时间回到事故前水平），持续观察 10 分钟无复发。
 
 三项全部达标才能宣布解决；任一未达标回到 SOP 步骤 1 重新排查。
+
+### 瓶颈转移：优化后必须重新出图
+
+解决一个瓶颈后，原来不起眼的函数会暴露为新热点——不是它们变慢了，而是"巨型怪物"消失了。**每次优化后必须重新采样出图**，确认新热点是否可接受，避免盲目优化。
+
+示例：bubble_sort 从 94.95% 消失后，matrix_multiply 从 3.54% 暴露为 71.2% 的新热点——这就是瓶颈转移。
 
 ## 实战案例参照（锁竞争导致 CPU 90%+）
 
@@ -453,3 +541,15 @@ perf stat -p <pid> -- sleep 10
 根因：连接池用自旋锁（SpinLock），低并发没问题，并发一上来自旋空转消耗大量 CPU。火焰图最宽平顶：`SpinLock::lock()` → `ConnectionPool::getConn()` → `handleRequest()`——每个请求都从连接池拿连接，连接池用自旋锁保护，高并发疯狂自旋。
 
 修复：自旋锁改互斥锁（mutex）+ 适当扩大连接池大小 → CPU 降到 30% 以下。
+
+## Brendan Gregg 工具体系（知识框架）
+
+火焰图只是 Brendan Gregg 工具体系的一层。完整体系分三层，**绝大多数开发者掌握前两层就够**：
+
+| 层级   | 工具                | 定位                   | 使用者          |
+| ------ | ------------------- | ---------------------- | --------------- |
+| 基础层 | ftrace、perf        | 内核内置，日常性能采样 | 所有开发者      |
+| 可视层 | FlameGraph、HeatMap | 把数据画成图           | 所有开发者      |
+| 进阶层 | bcc、bpftrace       | 内核级动态追踪         | SRE、内核工程师 |
+
+日常 CPU 排查用 perf + 火焰图（基础层 + 可视层）就够了。bcc/bpftrace 留给需要内核级动态追踪的疑难杂症。
