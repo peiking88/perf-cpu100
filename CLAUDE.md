@@ -11,6 +11,7 @@ There is no build system, linter, or unit test runner here. "Correctness" means 
 ## Structure
 
 - **`SKILL.md`** — the skill itself. Frontmatter (`name`, `description`) controls triggering; the body is the full SOP (decision tree, three-tool workflow, D-state番外, common pitfalls, verification steps, case study).
+- **`references/`** — deep-dive material loaded on demand: `tma-metrics.md`（TMA 四分类判读与度量陷阱）、`optimization-playbook.md`（按瓶颈分类的修复手册）、`code-examples-{memory,compute,frontend-thread}.md`（反例→正例代码对，来源 perf-book/perf-ninja）.
 - **`evals/evals.json`** — evaluation cases. Each entry: `id`, `name`, `user prompt`, `expected_output` (behavioral rubric, not exact text), `files` (attachments, currently unused).
 - **`.skill-forge/state.json`** — skill-forge bookkeeping (tool call count, compaction flag). Handled by the skill-forge harness; don't edit manually.
 - **`.claude/skills/skill_registry.json`** — local skill registry. Managed by the Claude Code skill system.

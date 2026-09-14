@@ -1,6 +1,6 @@
 ---
 name: perf-cpu100
-description: 线上 CPU 飙高（如 90%+）/响应时间暴涨的排查技能：strace 定方向 → perf 找热点+火焰图 → ftrace 入内核，附 D 状态（kill -9 无效）进程排查。Use when：CPU 使用率高、load 高、服务变慢需区分业务代码/系统调用/内核开销时。即使用户只说"服务变卡""top 里进程吃 CPU""线程空转"而未提任何性能工具，也要使用。Do NOT use：数据库锁（MySQL 行锁/分布式锁）、内存泄漏 OOM、网络丢包、容量规划问题。
+description: 线上 CPU 飙高（如 90%+）/响应时间暴涨的排查技能：strace 定方向 → perf 找热点+火焰图 → ftrace 入内核，热点定位后用 TMA 四分类判读瓶颈（Frontend/Backend/Bad Speculation/Retiring）并按 playbook 修复（内存/向量化/分支/伪共享等），附 D 状态（kill -9 无效）进程排查。Use when：CPU 使用率高、load 高、服务变慢需区分业务代码/系统调用/内核开销时；热点函数已找到但不知为什么慢、怎么优化时；多线程 CPU 高但吞吐低（自旋/伪共享）时。即使用户只说"服务变卡""top 里进程吃 CPU""线程空转""这个函数为什么慢"而未提任何性能工具，也要使用。Do NOT use：数据库锁（MySQL 行锁/分布式锁）、内存泄漏 OOM、网络丢包、容量规划问题。
 ---
 
 # perf-cpu100：CPU 飙高性能问题排查（strace + perf + ftrace 三板斧）
@@ -72,6 +72,8 @@ strace -c 结果的分支解读：
 5. **修复后必须验证**（见"验证"章节），未达标回到步骤 1
 
 每完成一步向用户汇报发现、确认方向后再继续，不要一次挂满所有工具。
+
+步骤 3 的"直接改代码"若不知从何下手：先用 TMA 判读瓶颈类型再查修复手册，见下文"定位热点之后：TMA 判读 + 修复 playbook"章节。
 
 ## 第一板斧：strace——先看进程在干什么
 
@@ -234,6 +236,28 @@ perf stat -p $(pidof your_app) -- sleep 10
 ```
 
 判读：IPC（Instructions Per Cycle）只有 0.35，正常应在 1.0 以上。这么低说明 CPU 大量时间在等待——要么等内存（cache miss），要么等锁（空转）。
+
+> IPC 细分阈值（补充）：内存密集型应用 IPC 0–1 属正常，计算密集型 4–6；判读其它指标（MPKI、branch-misses%、Load Miss 延迟、DRAM 带宽）及 SMT/频率缩放/多路复用等度量陷阱见 `references/tma-metrics.md` §四/§六。
+
+### perf stat --topdown / toplev：TMA 四分类，回答"为什么慢"
+
+perf stat 只给一个总 IPC，分不清 CPU 时间浪费在取指、误预测还是等内存。TMA（Top-Down Microarchitecture Analysis）把 pipeline slot 浪费原因分成四桶，直接对应修复方向：
+
+| 桶              | 含义              | 阈值                          | 修复                 |
+| --------------- | ----------------- | ----------------------------- | -------------------- |
+| Retiring        | 有用工作          | >80% 但仍慢 = 待向量化        | 向量化               |
+| Frontend Bound  | 取指/译码瓶颈     | >20% 投入                     | 代码布局/PGO         |
+| Bad Speculation | 分支误预测        | >10% 排查                     | cmov/查表            |
+| Backend Bound   | 内存/执行单元等待 | 剩余大头，下钻 Memory vs Core | 数据结构/预取/依赖链 |
+
+```bash
+perf stat -- ./your_app        # Intel 新版 perf 默认输出 tma_* 四桶
+perf stat -M PipelineL1,PipelineL2 -- ./your_app   # AMD Zen4+（内核 6.2+）
+```
+
+完整下钻流程、定位到源码行的精确事件采样命令、按平台的 toplev 用法：`references/tma-metrics.md`。
+
+<!-- 来源: external/perf-book/chapters/6-CPU-Features-For-Performance-Analysis/ -->
 
 ### perf lock：专门分析锁竞争
 
@@ -475,6 +499,9 @@ yum install perf                        # CentOS/RHEL
 apt install trace-cmd
 yum install trace-cmd
 
+# pmu-tools（toplev，TMA L2/L3 下钻用，见 references/tma-metrics.md）
+git clone https://github.com/andikleen/pmu-tools ~/pmu-tools
+
 # strace
 apt install strace
 yum install strace
@@ -497,6 +524,16 @@ echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid   # 临时放开（重启
 ```
 
 值含义：4=仅 root；2=不允许内核分析；1=允许用户态采样（推荐生产值）；0=允许内核态采样；-1=无限制。
+
+<!-- 来源: external/perf-book/chapters/7-Overview-Of-Performance-Analysis-Tools/7-4 Linux perf.md -->
+
+配套权限：内核符号显示为地址串时，再放开 `kptr_restrict`：
+
+```bash
+echo 0 | sudo tee /proc/sys/kernel/kptr_restrict   # 允许非特权用户解析内核模块符号
+```
+
+perf.data 离线分析可用 KDAB Hotspot（类 VTune GUI）或 Netflix Flamescope（时间热图，圈选时段出该时段火焰图，可发现分阶段异常）。
 
 ## 验证：修复后必须复测
 
@@ -521,6 +558,29 @@ perf stat -p <pid> -- sleep 10
 解决一个瓶颈后，原来不起眼的函数会暴露为新热点——不是它们变慢了，而是"巨型怪物"消失了。**每次优化后必须重新采样出图**，确认新热点是否可接受，避免盲目优化。
 
 示例：bubble_sort 从 94.95% 消失后，matrix_multiply 从 3.54% 暴露为 71.2% 的新热点——这就是瓶颈转移。
+
+## 定位热点之后：TMA 判读 + 修复 playbook
+
+SOP 步骤 3 说"用户态热点直接改代码"——改成什么？先回答"为什么慢"再动手：
+
+1. **判瓶颈类型**：`perf stat` 看 TMA 四桶 + branch-misses%（速查表见上文"perf stat --topdown"小节，完整方法 `references/tma-metrics.md`）。
+2. **按类型查修复手册** `references/optimization-playbook.md`：
+   - Memory Bound → 数据结构（数组优先/SoA/字段重排）→ 循环交换/分块 → 软件预取 → 大页（典型收益：循环交换 10x、预取 +87%、大页 +20%）
+   - Core Bound → 依赖链交织（2x）→ 内联（+47%）→ 向量化（10x）
+   - Bad Speculation → cmov / 条件存储 / 查表 / 虚调用对象分组（3–5x，误预测可降到 0.1% 以下）
+   - Frontend Bound → likely 提示 / hot-cold 拆分 / PGO（最高 +30%）/ LTO/BOLT
+
+   每类手法的**反例→正例完整代码对**（含实测收益数字，perf-book + perf-ninja 27 个实验）：
+   - Memory Bound → `references/code-examples-memory.md`
+   - Core Bound + Bad Speculation → `references/code-examples-compute.md`
+   - Frontend Bound + 多线程/锁 + 低延迟 + 方法论 → `references/code-examples-frontend-thread.md`
+
+3. **多线程专项**（与本技能锁竞争场景直连）：CPU 高但吞吐低先想 Spin Time；**多线程各写各的变量但同处一条 cache line（伪共享）**——现象是 IPC 极低（可达 0.05），检测 `perf c2c record -p <pid> -- sleep 10 && perf c2c report --stdio` 看 HITM/共享行，修复 `alignas(64)`（实测 >80% 收益）；`grep TLB /proc/interrupts` 某核异常高 = TLB shootdown。
+4. 修完回到"验证"章节复测，循环到瓶颈可接受。
+
+C/C++ 编译选项底线三件套：`-O3 -march=native -flto`；确认向量化是否发生：Clang `-Rpass=vectorizer` / GCC `-fopt-info`。
+
+<!-- 来源: external/perf-book/ + external/perf-ninja/（详见 references/ 内分节标注） -->
 
 ## 实战案例参照（锁竞争导致 CPU 90%+）
 
