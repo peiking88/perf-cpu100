@@ -3,12 +3,12 @@
   "skills": [
     {
       "name": "perf-cpu100",
-      "version": "1.0.7",
+      "version": "1.0.9",
       "scope": "personal",
       "created": "2026-09-07",
-      "updated": "2026-09-07",
+      "updated": "2026-09-14",
       "auto_trigger": true,
-      "description_chars": 239,
+      "description_chars": 462,
       "eval_score": 0,
       "usage_count": 0
     }

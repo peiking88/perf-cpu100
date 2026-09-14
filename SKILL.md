@@ -1,6 +1,6 @@
 ---
 name: perf-cpu100
-description: 线上 CPU 飙高（如 90%+）/响应时间暴涨的排查技能：strace 定方向 → perf 找热点+火焰图 → ftrace 入内核，热点定位后用 TMA 四分类判读瓶颈（Frontend/Backend/Bad Speculation/Retiring）并按 playbook 修复（内存/向量化/分支/伪共享等），附 D 状态（kill -9 无效）进程排查。Use when：CPU 使用率高、load 高、服务变慢需区分业务代码/系统调用/内核开销时；热点函数已找到但不知为什么慢、怎么优化时；多线程 CPU 高但吞吐低（自旋/伪共享）时。即使用户只说"服务变卡""top 里进程吃 CPU""线程空转""这个函数为什么慢"而未提任何性能工具，也要使用。Do NOT use：数据库锁（MySQL 行锁/分布式锁）、内存泄漏 OOM、网络丢包、容量规划问题。
+description: 线上 CPU 飙高（如 90%+）/响应时间暴涨的排查技能：strace 定方向 → perf 找热点+火焰图 → ftrace 入内核，热点定位后用 TMA 四分类判读瓶颈（Frontend/Backend/Bad Speculation/Retiring）并按 playbook 修复（内存/向量化/分支/伪共享等），附 D 状态（kill -9 无效）进程排查与整机 CPI 突增的 split lock/总线锁排查。Use when：CPU 使用率高、load 高、服务变慢需区分业务代码/系统调用/内核开销时；热点函数已找到但不知为什么慢、怎么优化时；多线程 CPU 高但吞吐低（自旋/伪共享）时；整机所有核 CPI 突增怀疑总线锁（bus lock/split lock）时。即使用户只说"服务变卡""top 里进程吃 CPU""线程空转""这个函数为什么慢""所有核一起变慢"而未提任何性能工具，也要使用。Do NOT use：数据库锁（MySQL 行锁/分布式锁）、内存泄漏 OOM、网络丢包、容量规划问题。
 ---
 
 # perf-cpu100：CPU 飙高性能问题排查（strace + perf + ftrace 三板斧）
@@ -409,6 +409,33 @@ iostat -xz 1 5
 - `rpc_wait_bit_killable` → 卡在 NFS 的 RPC 等待
 - `jbd2_journal_commit_transaction` → ext4 日志刷盘卡住
 - `blk_mq_get_tag` → 块设备队列满了
+
+## 番外二：整机所有核 CPI 突增——split lock / 总线锁
+
+症状签名：整机所有业务、所有核的 CPI 从 <1 突增至 3–4（指令数不变 → CPU 利用率同步涨三四倍）；TMA 表现为 Frontend 取指反常（L1I miss 极高、icache 命中大量来自 remote CCD），而 L3/内存访问**反而下降**——与"内存带宽上涨导致 CPI 升"的常见模式相反，见到即应怀疑总线锁。
+
+成因一句话：**跨缓存行的原子操作**（split lock，如对未对齐地址 xchg/CAS）触发总线锁（bus lock），AMD 上会拖慢整机所有核（Intel 微架构已把影响限制在单物理核）。
+
+快速检测：
+
+```bash
+# AMD：数 bus lock 事件（须在产生 bus lock 的环境里采——宿主机与 VM 的 PMU 上下文分离，宿主机抓不到 VM 内的）
+perf stat -e ls_locks.bus_lock
+perf record -e ls_locks.bus_lock && perf script -F pid   # 定位到引发线程
+
+# Intel：原始事件 + 内核日志（VM 内 split lock 宿主机可见 #AC 日志；AMD 5.10 内核无此检测）
+perf stat -e r102c
+dmesg | grep 'split_lock trap'   # "#AC: ... took a split_lock trap at address: ..."
+
+# 线程 100% 且热点在 __lll_lock_wait_private→futex 时，抓 futex 等待地址看是否跨行/非法
+bpftrace -e 'tracepoint:syscalls:sys_enter_futex /pid==12345/ {@cnt[tid,args->uaddr,args->op,args->val,args->uaddr2,ustack]=count();} interval:s:1 {print(@cnt); clear(@cnt);}'
+```
+
+锁地址未对齐跨 64B 行或为非法值（案例中 uaddr=0xffffffff）即实锤。定位元凶进程可用 `kill -SIGSTOP` 逐个停进程二分，机器恢复即锁定。
+
+平台差异（ratelimit 参数）、jemalloc/glibc 混用根因案例、原子变量对齐预防规范 6 条：`references/split-lock.md`。编码预防一句话：原子变量 `alignas` 到自然边界（64 位→64B、`__int128`→16B），禁止 packed 结构体里放原子类型。
+
+<!-- 来源: https://mp.weixin.qq.com/s/4DtVUCPSz7UWQ-icIV830g -->
 
 ## 火焰图该用还是不该用
 

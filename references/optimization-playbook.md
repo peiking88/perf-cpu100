@@ -113,6 +113,12 @@
 - 修复：`struct alignas(64) Accumulator { std::atomic<uint32_t> value; };`（Apple M1/M2+ 注意 L2 行 128B）。实测 209ms→36.3ms（>80%）。
 - 真共享先排数据竞争（ThreadSanitizer），再改 TLS：`thread_local` 各线程本地累加最后合并，优于 atomic 串行化。
 
+**原子操作跨缓存行 → split lock/总线锁**（整机所有核 CPI 突增 3–4 倍的元凶之一）
+
+- 跨 64B 缓存行的原子操作（xchg/CAS）触发总线锁，AMD 上拖慢整机所有核（Intel 限于单物理核）。检测命令、平台差异、原子对齐预防规范 6 条见 `references/split-lock.md`。
+
+<!-- 来源: https://mp.weixin.qq.com/s/4DtVUCPSz7UWQ-icIV830g -->
+
 **TLB shootdown**（多线程低延迟最易忽视）
 
 - munmap/madvise 等触发内核 IPI 使所有相关核失效 TLB，随线程数放大。检测：`watch -n5 -d 'grep TLB /proc/interrupts'`（某核比其他核高一个数量级即中招；常见元凶是自动 NUMA 均衡：`sysctl -w numa_balancing=0`）。
